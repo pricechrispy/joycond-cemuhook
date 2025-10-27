@@ -20,6 +20,11 @@ from gi.repository import GLib
 
 loop = GLib.MainLoop()
 
+# Motion control constants
+MOTION_REPORT_FREQ = 240  # Hz
+COUNTER_ROTATION_THRESHOLD = 10.0  # deg/s - minimum peak to detect counter-rotation
+SUPPRESSION_THRESHOLD = 3.0  # deg/s - values below this are suppressed
+
 DEVICE_NAMES = [
     "Nintendo Switch Left Joy-Con",
     "Nintendo Switch Right Joy-Con",
@@ -187,6 +192,10 @@ class SwitchDevice:
 
         self.state.update(accel_x=0.0, accel_y=0.0, accel_z=0.0,
                           motion_x=0.0, motion_y=0.0, motion_z=0.0)
+        
+        # Counter-rotation suppression: track peak rotation speed and sign changes
+        self.peak_gyro = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+        self.gyro_sign_change_time = {'x': -1.0, 'y': -1.0, 'z': -1.0}
 
         self.battery = None
         self.dbus_interface, self.dbus_properties_interface = self.get_battery_dbus_interface()
@@ -239,40 +248,140 @@ class SwitchDevice:
         self._terminate_event.set()
         self.thread.join()
 
+    def _process_gyro_axis(self, axis_name, gyro_val, current_time, should_log):
+        """Process gyroscope data for a single axis with deadzone and counter-rotation detection."""
+        motion_key = f'motion_{axis_name}'
+        
+        if abs(gyro_val) > args.gyro_deadzone:
+            # Track peak rotation speed
+            if abs(gyro_val) > abs(self.peak_gyro[axis_name]):
+                self.peak_gyro[axis_name] = gyro_val
+            
+            # Detect counter-rotation: sign change from a significant peak
+            if (self.gyro_sign_change_time[axis_name] < 0 and
+                self.peak_gyro[axis_name] * gyro_val < 0 and
+                abs(self.peak_gyro[axis_name]) > COUNTER_ROTATION_THRESHOLD):
+                self.gyro_sign_change_time[axis_name] = current_time
+                if should_log:
+                    print_verbose(f"[{axis_name.upper()}] Counter-rotation detected: "
+                                f"peak={self.peak_gyro[axis_name]:.2f} current={gyro_val:.2f}")
+            
+            self.state[motion_key] = gyro_val
+        else:
+            self.state[motion_key] = 0.0
+
     async def _handle_motion_events(self):
         print_verbose(F"Motion events task started {self.device}")
+        last_log_time = 0
+        last_motion_log_time = 0
+        
         try:
             async for event in self.motion_device.async_read_loop():
                 if event.type == evdev.ecodes.EV_ABS:
-                    # Get info about the axis we're reading the event from
                     axis = self.motion_device.absinfo(event.code)
+                    should_log = time.time() - last_log_time >= args.verbose_log_interval
+                    current_time = time.time()
 
-                    if event.code == evdev.ecodes.ABS_RX:
-                        self.state['motion_x'] += event.value / axis.resolution
-                    if event.code == evdev.ecodes.ABS_RY:
-                        self.state['motion_y'] += event.value / axis.resolution
-                    if event.code == evdev.ecodes.ABS_RZ:
-                        self.state['motion_z'] += event.value / axis.resolution
-                    if event.code == evdev.ecodes.ABS_X:
+                    # Gyroscope axes (instantaneous rotation rate in deg/s)
+                    gyro_axes = {
+                        evdev.ecodes.ABS_RX: 'x',
+                        evdev.ecodes.ABS_RY: 'y',
+                        evdev.ecodes.ABS_RZ: 'z'
+                    }
+                    
+                    if event.code in gyro_axes:
+                        axis_name = gyro_axes[event.code]
+                        gyro_val = event.value / axis.resolution
+                        self._process_gyro_axis(axis_name, gyro_val, current_time, should_log)
+                        
+                        if should_log:
+                            print_verbose(f"Gyro {axis_name.upper()}: raw={event.value} rate={gyro_val:.2f} "
+                                        f"peak={self.peak_gyro[axis_name]:.2f}")
+                            if axis_name == 'z':  # Log once per cycle
+                                last_log_time = time.time()
+                    
+                    # Accelerometer axes (gravity/tilt in g-forces)
+                    elif event.code == evdev.ecodes.ABS_X:
                         self.state['accel_x'] = event.value / axis.resolution
-                    if event.code == evdev.ecodes.ABS_Y:
+                    elif event.code == evdev.ecodes.ABS_Y:
                         self.state['accel_y'] = event.value / axis.resolution
-                    if event.code == evdev.ecodes.ABS_Z:
+                    elif event.code == evdev.ecodes.ABS_Z:
                         self.state['accel_z'] = event.value / axis.resolution
-
-                    if event.code in [evdev.ecodes.ABS_X, evdev.ecodes.ABS_Y, evdev.ecodes.ABS_Z]:
+                
+                elif event.type == evdev.ecodes.EV_MSC and event.code == evdev.ecodes.MSC_TIMESTAMP:
+                    # Send motion reports at sensor timestamp events (~240Hz)
+                    if event.timestamp() - self.last_timestamp >= 1.0 / MOTION_REPORT_FREQ:
                         self.state["timestamp"] = time.time_ns() // 1000
+                        current_time = time.time()
+                        should_log = current_time - last_motion_log_time >= args.verbose_log_interval
+                        
+                        # Apply counter-rotation suppression
+                        any_suppressing = self._apply_counter_rotation_suppression(current_time, should_log)
+                        
+                        if should_log:
+                            motion_str = f"X={self.state['motion_x']:.2f} Y={self.state['motion_y']:.2f} Z={self.state['motion_z']:.2f}"
+                            print_verbose(f"Motion report: {motion_str}" +
+                                        (" [SUPPRESSING]" if any_suppressing else ""))
+                            last_motion_log_time = current_time
+                        
                         self.server.report(self, True)
-                elif event.type == evdev.ecodes.EV_MSC:
-                    if event.code == evdev.ecodes.MSC_TIMESTAMP:
-                        if event.timestamp() - self.last_timestamp >= 1.0/240.0:
-                            self.server.report(self, True)
-                            self.state['motion_x'] = 0.0
-                            self.state['motion_y'] = 0.0
-                            self.state['motion_z'] = 0.0
-                            self.last_timestamp = event.timestamp()
+                        self.last_timestamp = event.timestamp()
+        
         except (asyncio.CancelledError, OSError) as e:
             print_verbose("Motion events task ended")
+
+    def _apply_counter_rotation_suppression(self, current_time, should_log):
+        """Apply counter-rotation suppression to gyro and accelerometer data.
+        
+        Returns True if any axis is being suppressed.
+        """
+        suppression_window = args.suppression_window
+        
+        # Check if any axis is in suppression window
+        any_suppressing = any(
+            self.gyro_sign_change_time[axis] >= 0 and
+            current_time - self.gyro_sign_change_time[axis] < suppression_window
+            for axis in ['x', 'y', 'z']
+        )
+        
+        # Zero accelerometer to prevent emulator from using tilt data during suppression
+        if any_suppressing:
+            if should_log:
+                print_verbose("[SUPPRESS] Zeroing accelerometer during suppression window")
+            self.state['accel_x'] = 0.0
+            self.state['accel_y'] = 0.0
+            self.state['accel_z'] = 0.0
+        
+        # Suppress weak gyro movements and reset tracking after window expires
+        for axis in ['x', 'y', 'z']:
+            motion_key = f'motion_{axis}'
+            
+            if self.gyro_sign_change_time[axis] >= 0:
+                time_since = current_time - self.gyro_sign_change_time[axis]
+                
+                # Within suppression window
+                if time_since < suppression_window:
+                    if abs(self.state[motion_key]) < SUPPRESSION_THRESHOLD:
+                        if should_log:
+                            print_verbose(f"[SUPPRESS] {axis.upper()}: {self.state[motion_key]:.2f} -> 0.0 "
+                                        f"({time_since*1000:.0f}ms elapsed)")
+                        self.state[motion_key] = 0.0
+                
+                # Window expired - reset tracking
+                else:
+                    if should_log and abs(self.peak_gyro[axis]) > 0:
+                        print_verbose(f"[SUPPRESS] {axis.upper()} window expired, peak was {self.peak_gyro[axis]:.2f}")
+                    self.peak_gyro[axis] = 0.0
+                    self.gyro_sign_change_time[axis] = -1.0
+            
+            # Cross-suppress other axes during suppression window
+            elif any_suppressing and abs(self.state[motion_key]) < SUPPRESSION_THRESHOLD:
+                if should_log:
+                    print_verbose(f"[SUPPRESS] {axis.upper()} cross-suppressed: {self.state[motion_key]:.2f} -> 0.0")
+                self.state[motion_key] = 0.0
+        
+        return any_suppressing
+
 
     async def _handle_events(self):
         print_verbose(f"Input events task started for device {self.name}")
@@ -466,12 +575,13 @@ class UDPServer:
             device_state.get('accel_x'),
         ]
 
-        # Gyro rotation in deg/s
+        # Gyro rotation in deg/s with sensitivity multiplier
         if report_motion:
+            gyro_sens = args.gyro_sensitivity
             sensors.extend([
-                - device_state.get('motion_y'),
-                - device_state.get('motion_z'),
-                device_state.get('motion_x')
+                - device_state.get('motion_y') * gyro_sens,
+                - device_state.get('motion_z') * gyro_sens,
+                device_state.get('motion_x') * gyro_sens
             ])
         else:
             sensors.extend([0.0, 0.0, 0.0])
@@ -829,6 +939,14 @@ parser.add_argument(
     "-ip", "--ip", help="set custom port, default is 127.0.0.1", default="127.0.0.1")
 parser.add_argument(
     "-p", "--port", help="set custom port, default is 26760", type=int, default=26760)
+parser.add_argument(
+    "-gs", "--gyro-sensitivity", help="gyro sensitivity multiplier, default is 1.0", type=float, default=1.0)
+parser.add_argument(
+    "-gd", "--gyro-deadzone", help="gyro deadzone threshold in deg/s, default is 0.1", type=float, default=0.1)
+parser.add_argument(
+    "-sw", "--suppression-window", help="counter-rotation suppression window in seconds, default is 1.5", type=float, default=1.5)
+parser.add_argument(
+    "-vli", "--verbose-log-interval", help="interval between verbose log messages in seconds, default is 0.2", type=float, default=0.2)
 
 select_motion = parser.add_mutually_exclusive_group()
 select_motion.add_argument("-l", "--left-only", help="use only left Joy-Cons for combined device motion",
